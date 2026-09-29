@@ -19,6 +19,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/andrew/swh-git/internal/swh"
 )
 
 const testID = "swh:1:snp:0123456789012345678901234567890123456789"
@@ -46,6 +48,7 @@ func fixtureBundle(t *testing.T, compressed bool) ([]byte, string) {
 	}
 	gitRun(t, dir, "add", "hello.txt")
 	gitRun(t, dir, "-c", "user.name=Test", "-c", "user.email=test@example.org", "-c", "commit.gpgsign=false", "commit", "-m", "Initial")
+	gitRun(t, dir, "-c", "user.name=Test", "-c", "user.email=test@example.org", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "Second")
 	gitRun(t, dir, "branch", "other")
 	gitRun(t, dir, "tag", "example")
 	head := gitRun(t, dir, "rev-parse", "HEAD")
@@ -102,12 +105,17 @@ func fixtureBundle(t *testing.T, compressed bool) ([]byte, string) {
 	return buf.Bytes(), head
 }
 
-func testProxy(t *testing.T, api, cache string) *proxy {
+func testProxy(t *testing.T, api, cache string, configure ...func(*swh.Config)) *proxy {
 	t.Helper()
-	p, err := newProxy(api+"/api/1/", cache, "", 5*time.Second, time.Millisecond, 32<<20)
+	cfg := swh.Config{API: api + "/api/1/", Cache: cache, Timeout: 5 * time.Second, Poll: time.Millisecond, MaxBytes: 32 << 20}
+	for _, configure := range configure {
+		configure(&cfg)
+	}
+	p, err := newProxy(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(p.store.Close)
 	return p
 }
 
@@ -242,15 +250,14 @@ func TestVaultFailures(t *testing.T) {
 				_, _ = io.WriteString(w, tc.body)
 			}))
 			defer api.Close()
-			p := testProxy(t, api.URL, t.TempDir())
-			p.timeout = 30 * time.Millisecond
+			p := testProxy(t, api.URL, t.TempDir(), func(cfg *swh.Config) { cfg.Timeout = 30 * time.Millisecond })
 			w := httptest.NewRecorder()
 			p.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/"+testID+".git/info/refs?service=git-upload-pack", nil))
 			if w.Code != tc.expected {
 				t.Fatalf("status=%d, body=%s", w.Code, w.Body)
 			}
 			entries, err := os.ReadDir(p.cache)
-			if err != nil || len(entries) != 0 {
+			if err != nil || len(entries) != 1 || entries[0].Name() != ".locks" {
 				t.Fatalf("failed request left cache entries: %v, %v", entries, err)
 			}
 		})
@@ -297,6 +304,10 @@ func TestUnsafeBundles(t *testing.T) {
 		{"symlink", tar.Header{Name: testID + ".git/objects", Typeflag: tar.TypeSymlink, Linkname: "/tmp"}, 1 << 20},
 		{"hardlink", tar.Header{Name: testID + ".git/HEAD", Typeflag: tar.TypeLink, Linkname: "/etc/passwd"}, 1 << 20},
 		{"alternates", tar.Header{Name: testID + ".git/objects/info/alternates", Typeflag: tar.TypeReg}, 1 << 20},
+		{"alternates-mixed", tar.Header{Name: testID + ".git/objects/info/Alternates", Typeflag: tar.TypeReg}, 1 << 20},
+		{"alternates-upper", tar.Header{Name: testID + ".git/OBJECTS/INFO/ALTERNATES", Typeflag: tar.TypeReg}, 1 << 20},
+		{"alternates-http", tar.Header{Name: testID + ".git/objects/info/HTTP-Alternates", Typeflag: tar.TypeReg}, 1 << 20},
+		{"commondir", tar.Header{Name: testID + ".git/CommonDir", Typeflag: tar.TypeReg}, 1 << 20},
 		{"size", tar.Header{Name: testID + ".git/HEAD", Typeflag: tar.TypeReg, Size: 1024}, 600},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -319,15 +330,20 @@ func TestUnsafeBundles(t *testing.T) {
 				_, _ = io.WriteString(w, `{"status":"done"}`)
 			}))
 			defer api.Close()
-			p := testProxy(t, api.URL, t.TempDir())
-			p.maxBytes = tc.limit
+			p := testProxy(t, api.URL, t.TempDir(), func(cfg *swh.Config) { cfg.MaxBytes = tc.limit })
 			w := httptest.NewRecorder()
 			p.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/"+testID+".git/info/refs?service=git-upload-pack", nil))
 			if w.Code != http.StatusBadGateway {
 				t.Fatalf("status=%d: %s", w.Code, w.Body)
 			}
+			if strings.HasPrefix(tc.name, "alternates") && !strings.Contains(w.Body.String(), "external object alternates") {
+				t.Fatalf("alternates entry reached repository validation: %s", w.Body)
+			}
+			if tc.name == "commondir" && !strings.Contains(w.Body.String(), "external common directory") {
+				t.Fatalf("commondir entry reached repository validation: %s", w.Body)
+			}
 			entries, err := os.ReadDir(p.cache)
-			if err != nil || len(entries) != 0 {
+			if err != nil || len(entries) != 1 || entries[0].Name() != ".locks" {
 				t.Fatalf("unsafe bundle left cache entries: %v, %v", entries, err)
 			}
 		})
@@ -373,8 +389,7 @@ func TestDownloadRedirectDoesNotForwardToken(t *testing.T) {
 		_, _ = io.WriteString(w, `{"status":"done"}`)
 	}))
 	defer api.Close()
-	p := testProxy(t, api.URL, t.TempDir())
-	p.token = "test-token"
+	p := testProxy(t, api.URL, t.TempDir(), func(cfg *swh.Config) { cfg.Token = "test-token" })
 	w := httptest.NewRecorder()
 	p.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/"+testID+".git/info/refs?service=git-upload-pack", nil))
 	if w.Code != http.StatusOK {

@@ -1,59 +1,69 @@
 # swh-git
 
-swh-git is a local Go proxy for cloning archived repositories from [Software Heritage](https://www.softwareheritage.org/). It downloads bare repositories from the Vault and serves the cached copies through `git http-backend`.
+Clone archived repositories from [Software Heritage](https://www.softwareheritage.org/) with `git-remote-swh` using `swh::` addresses, or with the `swh-git` HTTP proxy. Both download bare repositories from the Vault and cache them locally.
 
-Building requires Go 1.27.1 or newer, as specified in [go.mod](go.mod). Running the proxy requires Git 2.32.0 or newer, including `git http-backend`; this minimum covers the [`GIT_CONFIG_GLOBAL`](https://git-scm.com/docs/git/2.32.0) setting used to disable global Git configuration.
+Building requires Go 1.27.1 or newer, as specified in [go.mod](go.mod). Running either command requires Linux or macOS and Git 2.32.0 or newer; this minimum covers the [`GIT_CONFIG_GLOBAL`](https://git-scm.com/docs/git/2.32.0) setting used to disable global Git configuration. The HTTP proxy also requires `git http-backend`.
 
-With Go and Git on your PATH, install and start the proxy. The install command places the binary in `GOBIN`, or `$(go env GOPATH)/bin` by default; add that directory to your PATH.
+## Remote helper
+
+Install the helper and add its install directory to your PATH: `GOBIN` if set, otherwise `$(go env GOPATH)/bin`. Git runs `git-remote-swh` automatically for `swh::` addresses.
+
+```sh
+go install github.com/andrew/swh-git/cmd/git-remote-swh@latest
+
+git clone swh::github.com/octocat/Hello-World
+git clone swh::swh:1:snp:f72e9d06dd0e58236a34328f094ca894a809f230 hello-archive
+git ls-remote --symref swh::github.com/octocat/Hello-World
+```
+
+The helper also accepts full origin URLs such as `swh::https://github.com/octocat/Hello-World`, and `swh://` can replace `swh::`. It serves clone, fetch, and `ls-remote` through `git upload-pack`, supports shallow clones, and refuses pushes. To install from a checkout, run `go install ./cmd/git-remote-swh`.
+
+## HTTP proxy
+
+Install and start the proxy, then clone in another terminal. It listens on loopback by default and has no HTTP authentication.
 
 ```sh
 go install github.com/andrew/swh-git@latest
 swh-git
 ```
 
-Or run it from a local checkout:
-
-```sh
-go run .
-```
-
-Clone an archived origin in another terminal:
-
 ```sh
 git clone http://127.0.0.1:8080/github.com/octocat/Hello-World.git
-```
-
-To clone a specific snapshot:
-
-```sh
 git clone http://127.0.0.1:8080/swh:1:snp:f72e9d06dd0e58236a34328f094ca894a809f230.git hello-archive
 ```
 
-The proxy accepts core `snp`, `rev`, `rel`, and `dir` SWHIDs, with an optional `.git` suffix. It does not accept qualified SWHIDs or content IDs. The [Vault API](https://docs.softwareheritage.org/devel/swh-web/uri-scheme-api-vault.html) reconstructs a snapshot's branches and releases; a directory produces a single commit.
-
-Origin paths default to HTTPS, but you can include the scheme: `http://127.0.0.1:8080/https://github.com/octocat/Hello-World.git`. Use an explicit `http://` prefix for HTTP origins. The proxy looks up the supplied origin URL, then retries without a trailing `.git` if the API returns 404.
-
-An origin resolves to its [latest archived snapshot](https://docs.softwareheritage.org/devel/swh-web/uri-scheme-api-origin.html#get--api-1-origin-(origin_url)-visit-latest-). A temporary redirect keeps Git's requests on that snapshot throughout the clone. Later fetches resolve the origin again, while a SWHID URL stays fixed and works without API access once cached.
-
-The first clone waits while Vault prepares the repository and the proxy downloads it. Status messages appear in the proxy's terminal, and preparation times out after 30 minutes by default. Change the timeout and polling interval with:
+From a checkout, use `go run .`. Flags override the corresponding environment settings:
 
 ```sh
 go run . -listen 127.0.0.1:8080 -cache /tmp/swh-git-cache -timeout 1h -poll 5s
 ```
 
-Repositories remain in the cache across restarts, with no automatic eviction. The default location is `swh-git` inside your OS user cache directory. Use one proxy process per cache directory; concurrent requests within that process share preparation of the same SWHID. `-max-bytes` limits each unpacked bundle, including tar headers, to 4 GiB by default.
+## Addresses and caching
 
-Set `SWH_TOKEN` to a [Software Heritage bearer token](https://docs.softwareheritage.org/devel/swh-web-client/index.html#authentication) before starting the proxy to authenticate API requests. For testing against another API server, use `-api` to override the API root.
+Both commands accept core `snp`, `rev`, `rel`, and `dir` SWHIDs, with an optional `.git` suffix. Qualified SWHIDs and content IDs are not accepted. The [Vault API](https://docs.softwareheritage.org/devel/swh-web/uri-scheme-api-vault.html) reconstructs a snapshot's branches and releases; a directory produces a single commit.
 
-The proxy supports clone and fetch, refuses pushes, and listens on loopback by default. Its HTTP server has no authentication. Cloning depends on what Software Heritage archived and whether Vault can prepare it; the proxy does not fetch submodule repositories or Git LFS content.
+Origin paths default to HTTPS, so include the scheme for HTTP origins: `swh::http://example.org/repo` or `http://127.0.0.1:8080/http://example.org/repo`. If the API returns 404, the lookup retries without a trailing `.git`.
 
-Run the tests:
+The helper uses an origin's [latest archived snapshot](https://docs.softwareheritage.org/devel/swh-web/uri-scheme-api-origin.html#get--api-1-origin-(origin_url)-visit-latest-) for each connection; the HTTP proxy selects it with a temporary redirect. Later fetches resolve the origin again, while a SWHID stays fixed and works without API access once cached.
 
-```sh
-go test -race ./...
-```
+The first request waits for Vault to prepare the repository and downloads the whole bundle, even for `git ls-remote` or a shallow clone. Progress goes to stderr, and preparation times out after 30 minutes by default.
 
-The tests run real Git clones and fetches against a local fake Vault API, without calling Software Heritage. They verify repository contents and refs, cache reuse across restarts, concurrent requests, and error handling.
+Configure either command with the environment variables below. To authenticate API requests, set `SWH_TOKEN` to a [Software Heritage bearer token](https://docs.softwareheritage.org/devel/swh-web-client/index.html#authentication).
+
+| Variable | Default | HTTP flag |
+| --- | --- | --- |
+| `SWH_CACHE` | `swh-git` inside your OS user cache directory | `-cache` |
+| `SWH_API` | `https://archive.softwareheritage.org/api/1/` | `-api` |
+| `SWH_TOKEN` | No token | |
+| `SWH_TIMEOUT` | `30m` | `-timeout` |
+| `SWH_POLL` | `2s` | `-poll` |
+| `SWH_MAX_BYTES` | `4294967296` (4 GiB, including tar headers) | `-max-bytes` |
+
+Helper and proxy processes can share a cache on a local filesystem, with a lock per SWHID to prevent duplicate preparation. Disconnecting an HTTP client leaves the shared download running; requests waiting on the same attempt receive its result. After an interrupted process, the next preparation of that SWHID removes its abandoned staging directories.
+
+Cached repositories remain across restarts, with no automatic eviction. Cloning depends on what Software Heritage archived and whether Vault can prepare it. Neither command retrieves submodule repositories or Git LFS content.
+
+Run the tests with `go test -race ./...`. They use real Git clones and fetches against a local fake Vault API, including refs, shared caches, interrupted processes, and unsafe bundles.
 
 ## License
 
