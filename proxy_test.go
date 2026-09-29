@@ -39,10 +39,14 @@ func gitRun(t *testing.T, dir string, args ...string) string {
 	return strings.TrimSpace(string(out))
 }
 
-func fixtureBundle(t *testing.T, compressed bool) ([]byte, string) {
+func fixtureBundle(t *testing.T, compressed bool, objectFormat ...string) ([]byte, string) {
 	t.Helper()
 	dir := t.TempDir()
-	gitRun(t, dir, "init", "--initial-branch=main")
+	args := []string{"init", "--initial-branch=main"}
+	if len(objectFormat) > 0 {
+		args = append(args, "--object-format="+objectFormat[0])
+	}
+	gitRun(t, dir, args...)
 	if err := os.WriteFile(filepath.Join(dir, "hello.txt"), []byte("hello from the archive\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}

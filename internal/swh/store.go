@@ -126,31 +126,36 @@ func (s *Store) Ensure(ctx context.Context, id string) (string, error) {
 	if !IsID(id) {
 		return "", fmt.Errorf("%w: invalid SWHID", ErrInvalidAddress)
 	}
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
 	repo := filepath.Join(s.config.Cache, id+".git")
-	if ready, err := cached(repo); ready || err != nil {
-		return repo, err
-	}
-	s.mu.Lock()
-	if err := s.lifetime.Err(); err != nil {
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		if ready, err := cached(repo); ready || err != nil {
+			return repo, err
+		}
+		s.mu.Lock()
+		if err := s.lifetime.Err(); err != nil {
+			s.mu.Unlock()
+			return "", err
+		}
+		flight, exists := s.flights[id]
+		if !exists {
+			flight = &preparation{done: make(chan struct{})}
+			s.flights[id] = flight
+			s.workers.Add(1)
+			go s.prepareShared(id, flight)
+		}
 		s.mu.Unlock()
-		return "", err
-	}
-	flight, exists := s.flights[id]
-	if !exists {
-		flight = &preparation{done: make(chan struct{})}
-		s.flights[id] = flight
-		s.workers.Add(1)
-		go s.prepareShared(id, flight)
-	}
-	s.mu.Unlock()
-	select {
-	case <-ctx.Done():
-		return "", ctx.Err()
-	case <-flight.done:
-		return flight.repo, flight.err
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-flight.done:
+			if exists && errors.Is(flight.err, context.DeadlineExceeded) {
+				continue
+			}
+			return flight.repo, flight.err
+		}
 	}
 }
 
@@ -159,6 +164,9 @@ func (s *Store) prepareShared(id string, flight *preparation) {
 	ctx, cancel := context.WithTimeout(s.lifetime, s.config.Timeout)
 	defer cancel()
 	flight.repo, flight.err = s.ensureLocked(ctx, id)
+	if flight.err != nil && ctx.Err() != nil {
+		flight.err = ctx.Err()
+	}
 	s.mu.Lock()
 	delete(s.flights, id)
 	close(flight.done)

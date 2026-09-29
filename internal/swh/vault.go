@@ -14,12 +14,16 @@ import (
 
 func (s *Store) cook(ctx context.Context, id string) error {
 	method := http.MethodPost
+	var lastStatus string
 	for {
 		task, err := s.api.task(ctx, method, id)
 		if err != nil {
 			return err
 		}
-		log.Printf("%s: %s %s", id, task.Status, task.Progress)
+		if task.Status != lastStatus {
+			log.Printf("%s: %s %s", id, task.Status, task.Progress)
+			lastStatus = task.Status
+		}
 		switch task.Status {
 		case "done":
 			return nil
@@ -62,11 +66,8 @@ func (s *Store) prepare(ctx context.Context, id string) error {
 		return fmt.Errorf("extract bundle: %w", err)
 	}
 	repo := filepath.Join(tmp, id+".git")
-	check := exec.CommandContext(ctx, s.git, "config", "--file", filepath.Join(repo, "config"), "--no-includes", "--type=bool", "--get", "core.bare")
-	check.Env = GitEnv()
-	bare, err := check.CombinedOutput()
-	if err != nil || strings.TrimSpace(string(bare)) != "true" {
-		return fmt.Errorf("bundle config must declare core.bare=true: %s (%v)", bare, err)
+	if err := s.validateBundleConfig(ctx, repo); err != nil {
+		return err
 	}
 	if err := os.WriteFile(filepath.Join(repo, "config"), []byte("[core]\n\trepositoryformatversion = 0\n\tbare = true\n[http]\n\treceivepack = false\n"), fileMode); err != nil {
 		return err
@@ -81,6 +82,22 @@ func (s *Store) prepare(ctx context.Context, id string) error {
 		return err
 	}
 	log.Printf("cached %s", id)
+	return nil
+}
+
+func (s *Store) validateBundleConfig(ctx context.Context, repo string) error {
+	check := exec.CommandContext(ctx, s.git, "config", "--file", filepath.Join(repo, "config"), "--no-includes", "--type=bool", "--get", "core.bare")
+	check.Env = GitEnv()
+	bare, err := check.CombinedOutput()
+	if err != nil || strings.TrimSpace(string(bare)) != "true" {
+		return fmt.Errorf("bundle config must declare core.bare=true: %s (%v)", bare, err)
+	}
+	check = exec.CommandContext(ctx, s.git, "config", "--file", filepath.Join(repo, "config"), "--no-includes", "--type=int", "--get", "core.repositoryformatversion")
+	check.Env = GitEnv()
+	version, err := check.CombinedOutput()
+	if err != nil || strings.TrimSpace(string(version)) != "0" {
+		return fmt.Errorf("unsupported bundle repository format: expected core.repositoryformatversion=0, got %q (%v)", strings.TrimSpace(string(version)), err)
+	}
 	return nil
 }
 
